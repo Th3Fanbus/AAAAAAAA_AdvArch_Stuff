@@ -1,6 +1,3 @@
-from collections import Counter
-from requests import Response
-from wsgiref.handlers import format_date_time
 import asyncio
 import functools
 import itertools
@@ -10,24 +7,33 @@ import secrets
 import sys
 import time
 
-#############################
-#  CONFIGURATION CONSTANTS  #
-#############################
+from collections import Counter
+from http import HTTPStatus
+from requests import Response
+from wsgiref.handlers import format_date_time
+
+################################
+#       CONFIG CONSTANTS       #
+################################
 
 # Host and port to try to connect to
 HOST_PORT = "localhost:5000"
 
-#############################
-#  CONFIGURATION FUNCTIONS  #
-#############################
+################################
+#       CONFIG FUNCTIONS       #
+################################
 
 # Vote generation function
 def cf_get_vote_value():
-    return random.randrange(20)
+    return random.randrange(25)
 
 # Client delay function
 def cf_client_wait():
-    time.sleep(random.weibullvariate(0.5, 5.0)) # TODO: Make dynamic, backoff?
+    time.sleep(random.weibullvariate(1.0, 5.0)) # TODO: Make dynamic, backoff?
+
+################################
+#       HELPER FUNCTIONS       #
+################################
 
 # Taken from Werkzeug code
 def is_json(mt):
@@ -56,6 +62,10 @@ def do_get(url, **kwargs):
 def do_post(url, **kwargs):
     return requests.post(url, **kwargs)
 
+################################
+#  MAIN CLIENT IMPLEMENTATION  #
+################################
+
 class Client:
     def __init__(self):
         self.username = secrets.token_hex(32)
@@ -73,7 +83,7 @@ class Client:
     def _join_pool(self):
         r = do_post("/join_pool", auth = (self.username, ""), json = {})
         match r:
-            case Response(status_code = 200 | 201, headers = headers):
+            case Response(status_code = HTTPStatus.OK | HTTPStatus.CREATED, headers = headers):
                 if is_json(headers["Content-Type"]):
                     data = r.json()
                     self.credentials = (self.username, data["password"])
@@ -91,7 +101,7 @@ class Client:
         condition = {"If-None-Match": self.latest_etag}
         r = do_get("/get_votes", auth = self.credentials, headers = condition)
         match r:
-            case Response(status_code = 304):
+            case Response(status_code = HTTPStatus.NOT_MODIFIED):
                 # If we get a Not Modified, we already know that consensus has
                 # not been reached. We can only retry a vote we were unable to
                 # post in a previous iteration due to e.g. failed precondition.
@@ -101,7 +111,7 @@ class Client:
                 # the server increment a sequence number (which would make the
                 # ETag change) or let clients vote whenever checking consensus.
                 return None, False
-            case Response(status_code = 200, headers = headers):
+            case Response(status_code = HTTPStatus.OK, headers = headers):
                 if not is_json(headers["Content-Type"]):
                     raise NotImplementedError("Non-JSON response received")
                 match r.json():
@@ -121,12 +131,11 @@ class Client:
 
                         # Collect votes
                         votes = [v for v, _ in vote_data.values() if v is not None]
-                        vlen = len(votes)
                         c = Counter(votes)
                         print(c)
 
                         # Decide what to do
-                        if vlen == 0:
+                        if len(votes) == 0:
                             # Pool has no votes, should never happen
                             return None, True
 
@@ -170,16 +179,18 @@ class Client:
 
     def post_vote(self):
         proposed_vote = self.choose_vote() if self.deferred_vote is None else self.deferred_vote
-        req = {
-            self.username: proposed_vote
-        }
         condition = {"If-Match": self.latest_etag}
-        r = do_post("/post_vote", auth = self.credentials, headers = condition, json = req)
+        r = do_post(
+            "/post_vote",
+            auth = self.credentials,
+            headers = condition,
+            json = {self.username: proposed_vote}
+        )
         match r:
-            case Response(status_code = 412):
+            case Response(status_code = HTTPStatus.PRECONDITION_FAILED):
                 print("Vote rejected as information has changed in the meantime")
                 self.deferred_vote = proposed_vote
-            case Response(status_code = 200, headers = headers):
+            case Response(status_code = HTTPStatus.OK, headers = headers):
                 print("Vote posted successfully")
                 self.deferred_vote = None
                 if is_json(headers["Content-Type"]):
@@ -196,23 +207,25 @@ class Client:
 
     def loop(self):
         while True:
+            # Get the decision outcome and whether we can vote again
             decision_outcome, can_vote = self.get_votes()
+            # If we reached a consensus, exit
             if decision_outcome is not None:
                 return decision_outcome
-
+            # If possible, vote
             if can_vote or self.deferred_vote is not None:
                 self.post_vote()
-
+            # If we cannot vote, wait for some time
             if not can_vote or self.deferred_vote is not None:
                 cf_client_wait()
 
 def main():
     with Client() as client:
-        return client.loop()
+        retval = client.loop()
+        print()
+        print(f"---> CONSENSUS REACHED ON {retval}")
+        print()
+        print("Byeeeee!")
 
 if __name__ == "__main__":
-    retval = main()
-    print()
-    print(f"---> CONSENSUS REACHED ON {retval}")
-    print()
-    print("Byeeeee!")
+    main()

@@ -1,23 +1,25 @@
-from collections import Counter
-from flask import Flask, Response, Request, jsonify, make_response
-from flask import request as g_request
-from hashlib import sha512
-from werkzeug.datastructures.auth import Authorization
 import functools
 import json
 import secrets
 import threading
 
-#############################
-#  CONFIGURATION CONSTANTS  #
-#############################
+from collections import Counter
+from flask import Flask, Response, Request, jsonify, make_response
+from flask import request as g_request
+from hashlib import sha512
+from http import HTTPStatus
+from werkzeug.datastructures.auth import Authorization
+
+################################
+#       CONFIG CONSTANTS       #
+################################
 
 # Number of clients voting in the same consensus pool
 CONSENSUS_POOL_SIZE = 3
 
-#############################
-#  CONFIGURATION FUNCTIONS  #
-#############################
+################################
+#       CONFIG FUNCTIONS       #
+################################
 
 # Given a pool size, return the minimum number of
 # matching votes to reach consensus. This must be
@@ -28,24 +30,20 @@ def cf_get_min_agree():
 # Trust no one
 assert cf_get_min_agree() <= CONSENSUS_POOL_SIZE
 
-STATUS_CODE_STRINGS = {
-    400: "Bad Request",
-    401: "Unauthorized",
-    403: "Forbidden",
-    404: "", # TODO: Figure out where this one went
-    405: "Method Not Allowed",
-    412: "Precondition Failed",
-    415: "Unsupported Media Type",
-    418: "I'm a teapot",
-    428: "Precondition required"
-}
+################################
+#       HELPER FUNCTIONS       #
+################################
 
 def response_from_code(status_code, error_details = None):
-    error_msg = ": ".join(filter(None, (STATUS_CODE_STRINGS.get(status_code), error_details)))
+    error_msg = ": ".join(filter(None, (status_code.phrase, error_details)))
     return make_response({"error": error_msg}, status_code)
 
+################################
+#        CONSENSUS POOL        #
+################################
+
 class ConsensusPool:
-    # Unsure if thread safety is achieved
+    # TODO: Unsure if thread safety is achieved
     pool_list = []
     pool_list_lock = threading.Lock()
 
@@ -77,15 +75,14 @@ class ConsensusPool:
                     cls.pool_list.append(pool)
             # Populate the pool with the client information
             pool.login_cookies[username] = secrets.token_hex(256)
-            pool.vote_sequence[username] = (None, 0)
-            return make_response(({"password": pool.login_cookies[username]}, 201))
+            pool.vote_sequence[username] = (None, 0) # voted number, sequence number
+            return make_response(({"password": pool.login_cookies[username]}, HTTPStatus.CREATED))
         else:
-            # Known username, try to authenticate
-            if pool.validate_creds(username, password):
-                return make_response(({}, 200))
-            else:
-                # TODO: Retry with other pools?
-                return response_from_code(403, "Incorrect password")
+            # Known username that requested to rejoin, try to authenticate
+            # TODO: If this fails, retry with other pools?
+            def do_check_creds():
+                return make_response(({}, HTTPStatus.OK))
+            return pool.validate_creds_and_run(username, password, do_check_creds)
 
     def __init__(self):
         # TODO: There can be threading issues in this class
@@ -100,46 +97,48 @@ class ConsensusPool:
             if len(votes) == 0:
                 # Empty pool? Should never happen
                 return True
+            # Do not allow joining a pool where consensus has already been reached
             _, count = Counter(votes).most_common(1)[0]
             return count < cf_get_min_agree()
         else:
             return False
 
-    def validate_creds(self, username, password):
-        return self.login_cookies[username] == password;
+    def validate_creds_and_run(self, username, password, func):
+        if self.login_cookies[username] == password:
+            return func() # N.B. this is meant to be a nested function
+        else:
+            return response_from_code(HTTPStatus.FORBIDDEN, "Incorrect password")
 
     def calculate_etag(self):
         return sha512(json.dumps(self.vote_sequence).encode("utf-8")).hexdigest()
 
     def get_votes(self, username, password, request):
-        if self.validate_creds(username, password):
+        def do_get_votes():
             data = jsonify({
                 "pool_size": CONSENSUS_POOL_SIZE,
                 "min_agree": cf_get_min_agree(),
-                "vote_data": self.vote_sequence
+                "vote_data": self.vote_sequence,
             })
-            resp = make_response((data, 200))
+            resp = make_response((data, HTTPStatus.OK))
             resp.set_etag(self.calculate_etag())
             return resp
-        else:
-            return response_from_code(403, "Incorrect password")
+        return self.validate_creds_and_run(username, password, do_get_votes)
 
     def post_vote(self, username, password, request):
-        if self.validate_creds(username, password):
+        def do_post_vote():
             print(request.if_match)
             if self.calculate_etag() in request.if_match:
                 number = request.get_json()[username]
                 (_, seq_number) = self.vote_sequence[username]
                 self.vote_sequence[username] = (number, seq_number + 1)
-                return make_response(({}, 200))
+                return make_response(({}, HTTPStatus.OK))
             else:
-                return response_from_code(412)
-        else:
-            return response_from_code(403, "Incorrect password")
+                return response_from_code(HTTPStatus.PRECONDITION_FAILED)
+        return self.validate_creds_and_run(username, password, do_post_vote)
 
-############################
-#  CURSED DECORATOR STUFF  #
-############################
+################################
+#    CURSED DECORATOR STUFF    #
+################################
 
 # There was absolutely no need to overcomplicate
 # ourselves making these decorators, but the fun
@@ -151,11 +150,11 @@ def require_auth(func):
     def wrapper(request):
         match request.authorization:
             case None:
-                return response_from_code(401)
+                return response_from_code(HTTPStatus.UNAUTHORIZED)
             case Authorization(parameters = {"username": username, "password": password}):
                 return func(username, password, request)
             case _:
-                return response_from_code(400, "Unhandled authorization format")
+                return response_from_code(HTTPStatus.BAD_REQUEST, "Unhandled authorization format")
     # Return decorated function
     return wrapper
 
@@ -167,7 +166,7 @@ def require_json(func):
         if request.is_json:
             return func(username, password, request)
         else:
-            return response_from_code(415, "Request must be JSON")
+            return response_from_code(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, "Request must be JSON")
     # Return decorated function
     return wrapper
 
@@ -180,7 +179,7 @@ def require_precondition(precondition):
             if request.headers.get(precondition) is not None:
                 return func(username, password, request)
             else:
-                return response_from_code(428, "Request must use " + precondition)
+                return response_from_code(HTTPStatus.PRECONDITION_REQUIRED, "Request must use " + precondition)
         # Return decorated function
         return wrapper
     # From the factory function, return the curried decorator function
@@ -192,11 +191,15 @@ def require_pool(func):
     def wrapper(username, password, request):
         pool = ConsensusPool.pool_for_username(username)
         if pool is None:
-            return response_from_code(401)
+            return response_from_code(HTTPStatus.UNAUTHORIZED)
         else:
             return func(pool, username, password, request)
     # Return decorated function
     return wrapper
+
+################################
+#       MAIN FLASK STUFF       #
+################################
 
 app = Flask(__name__)
 
@@ -227,11 +230,11 @@ def do_post_vote():
 
 @app.get("/get_pool_size")
 def do_get_pool_size():
-    return make_response(({"pool_size": CONSENSUS_POOL_SIZE}, 200))
+    return make_response(({"pool_size": CONSENSUS_POOL_SIZE}, HTTPStatus.OK))
 
 @app.get("/brew_coffee")
 def do_brew_coffee():
-    return response_from_code(418)
+    return response_from_code(HTTPStatus.IM_A_TEAPOT)
 
 if __name__ == "__main__":
     app.debug = True
